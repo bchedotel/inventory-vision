@@ -1,4 +1,4 @@
-# Inventory Vision
+# InventoryVision
 
 A computer vision system for detecting, classifying, and analyzing electronic components on PCB boards using YOLOv11.
 
