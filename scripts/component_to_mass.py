@@ -142,6 +142,45 @@ def load_class_map(path):
         sys.exit(1)
 
 
+def calculate_mass_per_detection(
+    component_file,
+    class_map=None,
+    image_width_mm=1.0,
+    image_height_mm=1.0,
+):
+    """Return each supported detection as an individual mass or IC-area record."""
+    if class_map is None:
+        class_map = default_class_map
+
+    records = []
+    with open(component_file, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+
+            classes = resolve_class_label(parts[0], class_map)
+            try:
+                width_mm = float(parts[3]) * float(image_width_mm)
+                height_mm = float(parts[4]) * float(image_height_mm)
+            except ValueError:
+                continue
+
+            area_mm2 = abs(width_mm * height_mm)
+            if area_mm2 <= 0:
+                continue
+
+            if classes == "ics":
+                records.append({"component_class": classes, "area_mm2": area_mm2})
+            elif classes in mass_model_map:
+                records.append({
+                    "component_class": classes,
+                    "mass_mg": _mass_nominal(classes, area_mm2),
+                })
+
+    return records
+
+
 def calculate_mass_per_class(
     component_file,
     class_map=None,

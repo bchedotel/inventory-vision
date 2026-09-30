@@ -8,6 +8,7 @@ import sys
 import cv2
 
 import pandas as pd
+import yaml
 
 import pyfiglet
 from rich import print
@@ -165,11 +166,154 @@ def extract_individual_ic_areas(labels_file, class_map, conf_thresholds, image_w
     return ic_records
 
 
+COMPONENT_TO_ECOINVENT_FLOW = {
+    "capacitors": "market for capacitor, for surface-mounting",
+    "diodes": "market for diode, glass-, for surface-mounting",
+    "leds": "market for light emitting diode",
+    "inductors": "market for inductor, low value multilayer chip",
+    "transistors": "market for transistor, surface-mounted",
+    "resistors": "market for resistor, surface-mounted",
+    "connectors": "market for electric connector, peripheral type buss",
+    "ics": "market for integrated circuit, logic type",
+}
+def build_inventory_amounts(total_mass_by_component):
+    """Convert component masses from mg to ecoinvent activity amounts in kg."""
+    inventory = {}
+    for component_name, mass_mg in total_mass_by_component.items():
+        if mass_mg is None or mass_mg <= 0:
+            continue
+        inventory[component_name] = {
+            'act_name': COMPONENT_TO_ECOINVENT_FLOW[component_name.lower()],
+            'amount': mass_mg / 1_000_000,
+        }
+    return inventory
+
+
+def add_ic_mass_exchange(inventory, total_ic_area_mm2):
+    """Add the ecoinvent IC exchange using the area-to-mass conversion."""
+    if total_ic_area_mm2 > 0:
+        inventory['ics'] = {
+            'act_name': COMPONENT_TO_ECOINVENT_FLOW['ics'],
+            'amount': (total_ic_area_mm2 * 0.078) / 18_000,
+        }
+    return inventory
+
+
+def add_pcb_exchange(inventory, board_area_mm2):
+    """Add one ecoinvent PCB exchange for the calibrated rectangular board area."""
+    if board_area_mm2 is not None and board_area_mm2 > 0:
+        inventory['pcb'] = {
+            'act_name': 'market for printed wiring board, for surface mounting, Pb free surface',
+            'amount': board_area_mm2 / 1_000_000,
+            'unit': 'square meter',
+        }
+    return inventory
+
+
+def export_ecs_lca_yaml(component_records, output_yaml, board_area_mm2=None):
+    """Write one ECS-LCA foreground entry for each detected component."""
+    yaml_inventory = {}
+    class_counts = {}
+    for record in component_records:
+        component_class = record['component_class']
+        class_counts[component_class] = class_counts.get(component_class, 0) + 1
+        component_name = f"{component_class}_{class_counts[component_class]}"
+
+        if component_class == 'ics':
+            yaml_inventory[component_name] = {
+                'type': 'chip',
+                'data': {
+                    'type': 'logic',
+                    'package': {
+                        'area': {
+                            'value': round(record['area_mm2'] / 100, 4),
+                            'unit': 'cm²',
+                        },
+                    },
+                },
+            }
+        else:
+            yaml_inventory[component_name] = {
+                'act_name': COMPONENT_TO_ECOINVENT_FLOW[component_class],
+                'amount': {
+                    'value': round(record['mass_mg'] / 1_000_000, 12),
+                    'unit': 'kg',
+                },
+            }
+
+    if board_area_mm2 is not None and board_area_mm2 > 0:
+        yaml_inventory['PCB'] = {
+            'type': 'pcb',
+            'data': {
+                'area': {
+                    'value': round(board_area_mm2 / 100, 4),
+                    'unit': 'cm²',
+                },
+            },
+        }
+
+    with open(output_yaml, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(yaml_inventory, f, sort_keys=False, default_flow_style=False)
+    return output_yaml
+
+
+def export_ecoinvent_inventory(inventory, board_name, output_file):
+    """Write an Excel inventory workbook suitable for Brightway import."""
+    production_sheet = f'{board_name} production'[:31]
+    sheet1_rows = [
+        ['Database', 'ElecImpact'],
+        ['format', 'Excel spreadsheet'],
+        [''],
+        ['Activity', board_name],
+        ['code', board_name],
+        ['Exchanges'],
+        ['name', 'alt-name', 'amount', 'unit', 'database', 'categories',
+         'location', 'type', 'uncertainty type', 'loc', 'scale', 'shape', 'minimum', 'maximum'],
+        [f'{board_name} production', '', '1', 'unit', 'ElecImpact', '',
+         'GLO', 'technosphere', '0', '(Unknown)', '(Unknown)', '(Unknown)', '(Unknown)', '(Unknown)'],
+    ]
+    exchanges = [{
+        'name': f'{board_name} production',
+        'amount': 1,
+        'unit': 'unit',
+        'database': board_name,
+        'location': 'GLO',
+        'type': 'production',
+        'custom_name': '',
+    }]
+    for values in inventory.values():
+        exchanges.append({
+            'name': values['act_name'],
+            'amount': values['amount'],
+            'unit': values.get('unit', 'kilogram'),
+            'database': 'ecoinvent-3.10-cutoff',
+            'location': 'GLO',
+            'type': 'technosphere',
+            'custom_name': '',
+        })
+
+    metadata = [['Activity', f'{board_name} production'],
+                ['code', f'{board_name} production'], ['Exchanges', '']]
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        pd.DataFrame(sheet1_rows).to_excel(
+            writer, sheet_name=board_name[:31], index=False, header=False)
+        pd.DataFrame(metadata).to_excel(
+            writer, sheet_name=production_sheet, index=False, header=False)
+        pd.DataFrame(exchanges).to_excel(
+            writer, sheet_name=production_sheet, index=False, startrow=len(metadata))
+    return output_file
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate Life Cycle Inventory from a PCB image")
     parser.add_argument('--input', required=True, nargs='+', help="Path(s) to input image(s).")
     parser.add_argument('--model', required=True, help="Path to the YOLO model (.pt) for detection")
-    parser.add_argument('--output-xlsx', help="Output Excel file path (default: output/<filename>_metrics.xlsx)")
+    output_mode = parser.add_mutually_exclusive_group(required=True)
+    output_mode.add_argument('--ecs-lca', action='store_true',
+                             help="Write an ECS-LCA foreground YAML inventory")
+    output_mode.add_argument('--ecoinvent', action='store_true',
+                             help="Write a Brightway-importable ecoinvent inventory workbook")
+    parser.add_argument('--output', help="Output inventory path (default: output/<board>_ecs_lca.yaml or <board>_inventory.xlsx)")
     parser.add_argument('--debug', action='store_true', help="Save debug images with detection rectangles")
     parser.add_argument('--human', action='store_true', help="Enable human-in-the-loop correction of detections (interactive GUI)")
     parser.add_argument('--metrics', action='store_true', help="Display detailed metrics for board and component dimensions after crop")
@@ -245,6 +389,8 @@ def main():
 
     all_total_mass         = []
     all_total_ic_area      = []
+    all_component_records  = []
+    board_area_mm2         = None
     all_counts_per_class   = []
     all_uncertainties      = []
     all_individual_ic_areas = []
@@ -475,6 +621,9 @@ def main():
             except Exception as e:
                 print(f"⚠️ Could not save crop data: {e}")
 
+        if board_area_mm2 is None:
+            board_area_mm2 = width_mm * height_mm
+
         ##-- TRANSFORM DETECTIONS TO CROPPED SPACE --
         original_img = cv2.imread(board_image_path)
         original_height, original_width = original_img.shape[:2]
@@ -663,6 +812,16 @@ def main():
                 state_file=state_file,
             )
 
+        if args.ecs_lca:
+            all_component_records.extend(
+                component_to_mass.calculate_mass_per_detection(
+                    component_file=output_labels,
+                    class_map=default_class_map,
+                    image_width_mm=width_mm,
+                    image_height_mm=height_mm,
+                )
+            )
+
         all_total_mass.append(total_mass)
         all_total_ic_area.append(total_ic_area)
         all_counts_per_class.append(counts_per_class)
@@ -744,35 +903,6 @@ def main():
         else:
             all_individual_ic_areas.append([])
 
-    ##-- GENERATE EXCEL OUTPUT --
-    component_to_flow = {
-        "Capacitor": "market for capacitor, for surface-mounting",
-        "capacitor": "market for capacitor, for surface-mounting",
-        "capacitors": "market for capacitor, for surface-mounting",
-        "Diode": "market for diode, glass-, for surface-mounting",
-        "diode": "market for diode, glass-, for surface-mounting",
-        "diodes": "market for diode, glass-, for surface-mounting",
-        "LED": "market for light emitting diode",
-        "led": "market for light emitting diode",
-        "leds": "market for light emitting diode",
-        "Inductor": "market for inductor, low value multilayer chip",
-        "inductor": "market for inductor, low value multilayer chip",
-        "inductors": "market for inductor, low value multilayer chip",
-        "Transistor": "market for transistor, surface-mounted",
-        "transistor": "market for transistor, surface-mounted",
-        "transistors": "market for transistor, surface-mounted",
-        "Resistor": "market for resistor, surface-mounted",
-        "resistor": "market for resistor, surface-mounted",
-        "resistors": "market for resistor, surface-mounted",
-        "Connector": "market for electric connector, peripheral type buss",
-        "connector": "market for electric connector, peripheral type buss",
-        "connectors": "market for electric connector, peripheral type buss",
-        "IC": "market for integrated circuit, logic type",
-        "ic": "market for integrated circuit, logic type",
-        "ICs": "market for integrated circuit, logic type",
-        "ics": "market for integrated circuit, logic type"
-    }
-
     # Merge results from all images
     merged_mass   = {}
     merged_ic_area = sum(all_total_ic_area)
@@ -829,84 +959,31 @@ def main():
     merged_total_comb_low   = max(0.0, merged_total_nom - math.sqrt(sq_comb_lo))
     merged_total_comb_high  = merged_total_nom + math.sqrt(sq_comb_hi)
 
-    # Build Excel rows
-    # Columns:
-    #   name | count | value (nom)
-    #   | mass_model_low | mass_model_high   <- model PI only
-    #   | mass_bbox_low  | mass_bbox_high    <- bbox uncertainty only
-    #   | mass_low       | mass_high         <- quadratic combination (both sources)
-    excel_data = []
+    base_filename = os.path.splitext(os.path.basename(image_paths[0]))[0]
+    base_filename = (base_filename
+                     .replace('_front', '').replace('_back', '')
+                     .replace('_top', '').replace('_bottom', '')
+                     .replace('_side1', '').replace('_side2', ''))
+    board_name = base_filename.replace(' ', '_')
+    inventory = build_inventory_amounts(merged_mass)
 
-    for component_class, mass_mg in merged_mass.items():
-        flow_name = component_to_flow.get(component_class, f"market for {component_class}")
-        count = merged_counts.get(component_class, 0)
-        u = merged_per_class.get(component_class, {})
-        nom        = u.get('nom',           mass_mg)
-        model_low  = u.get('model_low',     nom)
-        model_high = u.get('model_high',    nom)
-        bbox_low   = u.get('bbox_low',      nom)
-        bbox_high  = u.get('bbox_high',     nom)
-        comb_low   = u.get('combined_low',  nom)
-        comb_high  = u.get('combined_high', nom)
-
-        excel_data.append({
-            'name':             flow_name,
-            'count':            count,
-            'value':            round(nom,        6),
-            'mass_model_low':   round(model_low,  6),
-            'mass_model_high':  round(model_high, 6),
-            'mass_bbox_low':    round(bbox_low,   6),
-            'mass_bbox_high':   round(bbox_high,  6),
-            'mass_low':         round(comb_low,   6),
-            'mass_high':        round(comb_high,  6),
-        })
-
-    if merged_ic_area > 0:
-        ic_flow  = component_to_flow.get("IC", "market for integrated circuit, logic type")
-        ic_count = merged_counts.get("IC", merged_counts.get("ic",
-                   merged_counts.get("ICs", merged_counts.get("ics", 0))))
-        excel_data.append({
-            'name':            ic_flow,
-            'count':           ic_count,
-            'value':           merged_ic_area,
-            'mass_model_low':  merged_ic_area,
-            'mass_model_high': merged_ic_area,
-            'mass_bbox_low':   merged_ic_area,
-            'mass_bbox_high':  merged_ic_area,
-            'mass_low':        merged_ic_area,
-            'mass_high':       merged_ic_area,
-        })
-
-    # Summary row
-    excel_data.append({
-        'name':            'TOTAL',
-        'count':           sum(row['count'] for row in excel_data),
-        'value':           round(merged_total_nom,        4),
-        'mass_model_low':  round(merged_total_model_low,  4),
-        'mass_model_high': round(merged_total_model_high, 4),
-        'mass_bbox_low':   round(merged_total_bbox_low,   4),
-        'mass_bbox_high':  round(merged_total_bbox_high,  4),
-        'mass_low':        round(merged_total_comb_low,   4),
-        'mass_high':       round(merged_total_comb_high,  4),
-    })
-
-    df = pd.DataFrame(excel_data)
-
-    # Determine output path
-    if args.output_xlsx:
-        output_xlsx = args.output_xlsx
+    if args.output:
+        output_path = args.output
+    elif args.ecs_lca:
+        output_path = os.path.join('output', f'{board_name}_ecs_lca.yaml')
     else:
-        base_filename = os.path.splitext(os.path.basename(image_paths[0]))[0]
-        base_filename = (base_filename
-                         .replace('_front', '').replace('_back', '')
-                         .replace('_top', '').replace('_bottom', '')
-                         .replace('_side1', '').replace('_side2', ''))
-        output_xlsx = os.path.join("output", f"{base_filename}_metrics.xlsx")
+        output_path = os.path.join('output', f'{board_name}_inventory.xlsx')
 
-    df.to_excel(output_xlsx, index=False, sheet_name='Component Metrics')
+    if args.ecs_lca:
+        export_ecs_lca_yaml(all_component_records, output_path, board_area_mm2)
+        print(f"✅ ECS-LCA YAML inventory saved to: {output_path}")
+    else:
+        add_ic_mass_exchange(inventory, merged_ic_area)
+        add_pcb_exchange(inventory, board_area_mm2)
+        export_ecoinvent_inventory(inventory, board_name, output_path)
+        print(f"✅ Ecoinvent inventory workbook saved to: {output_path}")
 
     print(f"\n{'='*60}")
-    print(f"✅ Component metrics saved to: {output_xlsx}")
     if len(image_paths) > 1:
         print(f"   - Merged results from {len(image_paths)} images")
     print(f"   - ICs: total area = {merged_ic_area:.3f} mm²")
@@ -946,10 +1023,8 @@ def main():
             }])
             ic_df_with_total = pd.concat([ic_df, summary_row], ignore_index=True)
 
-            base_xlsx_noext = os.path.splitext(output_xlsx)[0]
-            if base_xlsx_noext.endswith('_metrics'):
-                base_xlsx_noext = base_xlsx_noext[:-len('_metrics')]
-            ic_output_xlsx = f"{base_xlsx_noext}_ic_areas.xlsx"
+            output_stem = os.path.splitext(output_path)[0]
+            ic_output_xlsx = f"{output_stem}_ic_areas.xlsx"
 
             ic_df_with_total.to_excel(ic_output_xlsx, index=False, sheet_name='Individual IC Areas')
 

@@ -35,7 +35,9 @@ uv run python main.py --input <image_path> --model <model_path> [options]
 - `--model` - Path to the YOLO model (.pt file)
 
 **Optional arguments:**
-- `--output-xlsx` - Output Excel file path
+- `--ecs-lca` - Export an ECS-LCA foreground YAML inventory
+- `--ecoinvent` - Export a Brightway-importable ecoinvent inventory workbook
+- `--output` - Output path for the selected inventory (defaults to `output/<board>_ecs_lca.yaml` or `output/<board>_inventory.xlsx`)
 - `--debug` - Save debug images with bounding boxes
 - `--human` - Enable human-in-the-loop correction (interactive GUI)
 - `--metrics` - Display detailed component dimension metrics
@@ -45,7 +47,8 @@ uv run python main.py --input <image_path> --model <model_path> [options]
 
 **Example:**
 ```bash
-uv run python main.py --input board.jpg --model model/best.pt --debug --human --metrics
+uv run python main.py --input board.jpg --model model/best.pt --ecs-lca
+uv run python main.py --input board.jpg --model model/best.pt --ecoinvent
 ```
 
 ### Training
