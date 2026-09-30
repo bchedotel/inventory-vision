@@ -1,6 +1,15 @@
 # InventoryVision
 A computer vision system for detecting, classifying, and analyzing electronic components on PCB boards using YOLOv11.
 
+## Credit
+This study is funded by the France2030 ESOS Project -- Electronics: Sustainable, Open and Sovereign, operated by French ANR (Agence Nationale de la Recherche).
+
+Paper: https://hal.science/hal-05661956/
+
+Contact:
+- benjamin.chedotel@insa-rennes.fr
+- maxime.pelcat@insa-rennes.fr
+
 ## Features
 - **Component Detection**: Detects 8 types of electronic components (resistors, inductors, capacitors, ICs, diodes, LEDs, connectors, transistors)
 - **Classification**: Classifies detected components with confidence scores
